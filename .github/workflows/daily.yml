@@ -2,8 +2,8 @@ name: PM Agent Daily
 
 on:
   schedule:
-    # 매일 11:00 UTC = 20:00 KST
-    - cron: "0 11 * * *"
+    # 매일 11:30 UTC = 20:30 KST
+    - cron: "30 11 * * *"
   workflow_dispatch:  # 수동 실행도 가능
 
 jobs:
