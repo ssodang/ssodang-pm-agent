@@ -1,0 +1,33 @@
+name: PM Agent Daily
+
+on:
+  schedule:
+    # 매일 11:00 UTC = 20:00 KST
+    - cron: "0 11 * * *"
+  workflow_dispatch:  # 수동 실행도 가능
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run PM agent
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_AGENDA_DB_ID: ${{ secrets.NOTION_AGENDA_DB_ID }}
+          NOTION_CALENDAR_DB_ID: ${{ secrets.NOTION_CALENDAR_DB_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python pm_agent.py
