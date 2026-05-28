@@ -2,7 +2,7 @@
 
 쏘댕 in BUSAN PM 에이전트. Notion 개발 논의 안건 DB를 매일 조회해서 마감 임박/기한 초과 안건을 슬랙으로 알림.
 
-GitHub Actions Cron으로 매일 09:00 KST에 자동 실행. 별도 서버 없음, 인프라 비용 0원.
+GitHub Actions Cron으로 매일 20:14 KST에 자동 실행. 별도 서버 없음, 인프라 비용 0원.
 
 ## 셋업
 
@@ -12,11 +12,12 @@ GitHub Actions Cron으로 매일 09:00 KST에 자동 실행. 별도 서버 없�
 |---|---|---|
 | `NOTION_TOKEN` | Notion Integration 토큰 | https://www.notion.so/profile/integrations |
 | `NOTION_AGENDA_DB_ID` | 개발 논의 안건 DB ID | DB URL의 32자리 UUID |
+| `NOTION_CALENDAR_DB_ID` | 회의 일정 캘린더 DB ID | DB URL의 32자리 UUID |
 | `SLACK_WEBHOOK_URL` | Slack Incoming Webhook URL | https://api.slack.com/apps |
 
 ### 2. GitHub Secrets 등록
 
-레포 **Settings → Secrets and variables → Actions → New repository secret** 에서 위 3개 등록.
+레포 **Settings → Secrets and variables → Actions → New repository secret** 에서 위 4개 등록.
 
 ### 3. Notion Integration을 DB에 초대
 
@@ -24,7 +25,7 @@ DB 페이지 우상단 `···` → `Connections` → `ssodang-pm-agent` 선택.
 
 ### 4. 동작 확인
 
-- 자동: 매일 09:00 KST
+- 자동: 매일 20:14 KST
 - 수동: **Actions 탭 → PM Agent Daily → Run workflow**
 
 ## 로컬 실행
