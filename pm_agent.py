@@ -1,7 +1,7 @@
 """
 ssodang PM Agent
 
-매일 20:14 KST에 GitHub Actions Cron으로 실행.
+매일 17:04 KST에 GitHub Actions Cron으로 실행.
 
 알림 내용:
   - 오늘 〈회의〉 태그 일정이 있으면 헤더 + @channel 호출
@@ -10,6 +10,7 @@ ssodang PM Agent
 
 import os
 import sys
+import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -30,6 +31,11 @@ IMMINENT_DAYS = 2
 # 미팅으로 인정할 태그
 MEETING_TAG = "회의"
 
+# Notion API는 평균 3 req/sec 제한이 있어 페이지네이션 사이에 여유를 둔다.
+NOTION_PAGE_SIZE = 50
+NOTION_MAX_RETRIES = 4
+NOTION_REQUEST_DELAY_SECONDS = 0.4
+
 # GitHub Actions runner는 UTC라서 날짜 판단은 명시적으로 KST 기준으로 한다.
 KST = ZoneInfo("Asia/Seoul")
 
@@ -38,14 +44,62 @@ def today_kst() -> date:
     return datetime.now(KST).date()
 
 
+def is_rate_limited_error(error: Exception) -> bool:
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    code = getattr(error, "code", None)
+    if hasattr(code, "value"):
+        code = code.value
+
+    return (
+        status_code == 429
+        or code == "rate_limited"
+        or "rate limited" in str(error).lower()
+    )
+
+
+def retry_after_seconds(error: Exception, attempt: int) -> float:
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    retry_after = headers.get("Retry-After") or headers.get("retry-after")
+
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
+
+    return min(2 ** attempt, 30)
+
+
+def query_database(notion: Client, db_id: str, **kwargs) -> dict:
+    for attempt in range(NOTION_MAX_RETRIES):
+        try:
+            return notion.databases.query(
+                database_id=db_id,
+                page_size=NOTION_PAGE_SIZE,
+                **kwargs,
+            )
+        except Exception as error:
+            is_last_attempt = attempt == NOTION_MAX_RETRIES - 1
+            if not is_rate_limited_error(error) or is_last_attempt:
+                raise
+
+            wait_seconds = retry_after_seconds(error, attempt)
+            print(f"⏳ Notion rate limit — {wait_seconds:g}초 후 재시도")
+            time.sleep(wait_seconds)
+
+    raise RuntimeError("Notion query retry failed unexpectedly")
+
+
 def query_all_database_pages(notion: Client, db_id: str, **kwargs) -> list[dict]:
     results = []
     start_cursor = None
 
     while True:
-        response = notion.databases.query(
-            database_id=db_id,
-            page_size=100,
+        response = query_database(
+            notion,
+            db_id,
             start_cursor=start_cursor,
             **kwargs,
         )
@@ -55,6 +109,7 @@ def query_all_database_pages(notion: Client, db_id: str, **kwargs) -> list[dict]
             return results
 
         start_cursor = response.get("next_cursor")
+        time.sleep(NOTION_REQUEST_DELAY_SECONDS)
 
 
 # ─────────── Notion: 캘린더에서 오늘 미팅 조회 ───────────
@@ -62,6 +117,7 @@ def query_all_database_pages(notion: Client, db_id: str, **kwargs) -> list[dict]
 def fetch_today_meetings(notion: Client, db_id: str) -> list[dict]:
     """캘린더 DB에서 오늘 날짜에 걸리는 '회의' 태그 일정 조회."""
     today = today_kst()
+    today_str = today.isoformat()
 
     pages = query_all_database_pages(
         notion,
@@ -75,6 +131,14 @@ def fetch_today_meetings(notion: Client, db_id: str) -> list[dict]:
                 {
                     "property": "기간",
                     "date": {"is_not_empty": True},
+                },
+                {
+                    "property": "기간",
+                    "date": {"on_or_before": today_str},
+                },
+                {
+                    "property": "기간",
+                    "date": {"on_or_after": today_str},
                 },
             ]
         },
@@ -112,12 +176,26 @@ def fetch_today_meetings(notion: Client, db_id: str) -> list[dict]:
 # ─────────── Notion: 안건 조회 ───────────
 
 def fetch_agenda_items(notion: Client, db_id: str) -> list[dict]:
+    imminent_cutoff = today_kst() + timedelta(days=IMMINENT_DAYS)
+
     pages = query_all_database_pages(
         notion,
         db_id,
         filter={
-            "property": "상태",
-            "select": {"does_not_equal": "완료"},
+            "and": [
+                {
+                    "property": "상태",
+                    "select": {"does_not_equal": "완료"},
+                },
+                {
+                    "property": "마감일",
+                    "date": {"is_not_empty": True},
+                },
+                {
+                    "property": "마감일",
+                    "date": {"on_or_before": imminent_cutoff.isoformat()},
+                },
+            ]
         },
         sorts=[{"property": "마감일", "direction": "ascending"}],
     )
@@ -132,7 +210,7 @@ def fetch_agenda_items(notion: Client, db_id: str) -> list[dict]:
         due_prop = props.get("마감일", {}).get("date")
         due_date = None
         if due_prop and due_prop.get("start"):
-            due_date = date.fromisoformat(due_prop["start"])
+            due_date = date.fromisoformat(due_prop["start"][:10])
 
         status_prop = props.get("상태", {}).get("select")
         status = status_prop["name"] if status_prop else "(미지정)"
@@ -182,31 +260,54 @@ def format_agenda(item: dict) -> str:
     return f"  • <{item['url']}|{item['title']}> (마감 {due_str}, {emoji} {item['status']})"
 
 
-def build_message(meetings: list[dict], classified: dict[str, list[dict]]) -> str | None:
+def build_error_message(title: str, error: Exception | str) -> str:
+    today_str = today_kst().strftime("%Y.%m.%d")
+    return "\n".join([
+        f"*[{today_str} PM Agent 알림]*",
+        "<!channel>",
+        "",
+        f"⚠️ *{title}*",
+        f"  • {error}",
+    ])
+
+
+def build_message(
+    meetings: list[dict],
+    classified: dict[str, list[dict]],
+    calendar_error: Exception | str | None = None,
+) -> str | None:
     overdue = classified["overdue"]
     imminent = classified["imminent"]
     has_meetings = len(meetings) > 0
     has_agenda = len(overdue) > 0 or len(imminent) > 0
+    has_calendar_error = calendar_error is not None
 
-    if not has_meetings and not has_agenda:
+    if not has_meetings and not has_agenda and not has_calendar_error:
         return None
 
     lines = []
 
-    # 미팅 섹션
-    if has_meetings:
+    if has_meetings or has_calendar_error:
         today_str = today_kst().strftime("%Y.%m.%d")
         lines.append(f"*[{today_str} 정기 미팅 스레드]*")
         lines.append("<!channel>")
         lines.append("")
+
+    # 미팅 섹션
+    if has_meetings:
         lines.append("📅 *오늘의 회의*")
         for m in meetings:
             lines.append(f"  • <{m['url']}|{m['title']}>")
         lines.append("")
 
+    if has_calendar_error:
+        lines.append("⚠️ *회의 캘린더 조회 실패*")
+        lines.append(f"  • {calendar_error}")
+        lines.append("")
+
     # 안건 섹션
     if has_agenda:
-        if has_meetings:
+        if has_meetings or has_calendar_error:
             lines.append("────────────────")
             lines.append("")
         lines.append("📋 *확인 필요한 개발 논의 안건*")
@@ -235,13 +336,20 @@ def send_to_slack(webhook_url: str, message: str) -> None:
     response.raise_for_status()
 
 
+def notify_failure(title: str, error: Exception | str) -> None:
+    try:
+        send_to_slack(SLACK_WEBHOOK_URL, build_error_message(title, error))
+        print("✅ 실패 알림 발송 완료")
+    except Exception as slack_error:
+        print(f"❌ 실패 알림 전송 실패: {slack_error}", file=sys.stderr)
+
+
 # ─────────── 메인 ───────────
 
 def main() -> int:
     missing = [name for name, value in {
         "NOTION_TOKEN": NOTION_TOKEN,
         "NOTION_AGENDA_DB_ID": NOTION_AGENDA_DB_ID,
-        "NOTION_CALENDAR_DB_ID": NOTION_CALENDAR_DB_ID,
         "SLACK_WEBHOOK_URL": SLACK_WEBHOOK_URL,
     }.items() if not value]
 
@@ -252,25 +360,32 @@ def main() -> int:
     notion = Client(auth=NOTION_TOKEN)
 
     # 캘린더 — 오늘 회의 조회
-    try:
-        meetings = fetch_today_meetings(notion, NOTION_CALENDAR_DB_ID)
-        print(f"📅 오늘 회의: {len(meetings)}건")
-    except Exception as e:
-        print(f"❌ 캘린더 조회 실패: {e}", file=sys.stderr)
-        return 1
+    meetings = []
+    calendar_error = None
+    if NOTION_CALENDAR_DB_ID:
+        try:
+            meetings = fetch_today_meetings(notion, NOTION_CALENDAR_DB_ID)
+            print(f"📅 오늘 회의: {len(meetings)}건")
+        except Exception as e:
+            calendar_error = e
+            print(f"⚠️ 캘린더 조회 실패 (알림은 계속 진행): {e}", file=sys.stderr)
+    else:
+        calendar_error = "NOTION_CALENDAR_DB_ID 미설정"
+        print(f"⚠️ {calendar_error} — 캘린더 조회 생략", file=sys.stderr)
 
     # 안건 조회
     try:
         items = fetch_agenda_items(notion, NOTION_AGENDA_DB_ID)
     except Exception as e:
         print(f"❌ 안건 조회 실패: {e}", file=sys.stderr)
+        notify_failure("안건 조회 실패", e)
         return 1
 
     classified = classify_items(items)
-    print(f"📊 안건: 총 {len(items)}건 / 기한 초과 {len(classified['overdue'])} / 임박 {len(classified['imminent'])}")
+    print(f"📊 안건 알림 대상: 총 {len(items)}건 / 기한 초과 {len(classified['overdue'])} / 임박 {len(classified['imminent'])}")
 
     # 메시지 조립
-    message = build_message(meetings, classified)
+    message = build_message(meetings, classified, calendar_error)
     if not message:
         print("✅ 알릴 거 없음. 종료.")
         return 0
